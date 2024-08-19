@@ -15,7 +15,7 @@ type TimerData struct {
 	expire time.Time
 	index  int
 	next   *TimerData
-	entry  Job
+	job    Job
 }
 
 // Delay delay duration.
@@ -91,18 +91,18 @@ func (t *Timer) get() (td *TimerData) {
 
 // put put back a timer data.
 func (t *Timer) put(td *TimerData) {
-	td.entry = nil
+	td.job = nil
 	td.next = t.free
 	t.free = td
 }
 
 // Add add the element x onto the heap. The complexity is
 // O(log(n)) where n = h.Len().
-func (t *Timer) Add(expire time.Time, entry *Entry) (td *TimerData) {
+func (t *Timer) Add(expire time.Time, job Job) (td *TimerData) {
 	t.lock.Lock()
 	td = t.get()
 	td.expire = expire
-	td.entry = entry
+	td.job = job
 	t.add(td)
 	t.lock.Unlock()
 	return
@@ -173,9 +173,9 @@ func (t *Timer) start() {
 // It is equivalent to Del(0).
 func (t *Timer) expire() {
 	var (
-		entry Job
-		td    *TimerData
-		d     time.Duration
+		job Job
+		td  *TimerData
+		d   time.Duration
 	)
 	t.lock.Lock()
 	for {
@@ -187,11 +187,11 @@ func (t *Timer) expire() {
 		if d = td.Delay(); d > 0 {
 			break
 		}
-		entry = td.entry
+		job = td.job
 		// let caller put back
 		t.del(td)
 		t.lock.Unlock()
-		t.ch <- entry
+		t.ch <- job
 		t.lock.Lock()
 	}
 	t.signal.Reset(d)

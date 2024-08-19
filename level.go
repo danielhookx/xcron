@@ -1,8 +1,111 @@
 package xcron
 
 import (
+	"context"
 	"time"
 )
+
+type JobLevel interface {
+	Pick() <-chan Job
+	Remove(*Entry)
+	Add(*Entry)
+	Redo(*Entry)
+}
+
+func WithHighLevel() *scheduleOption {
+	return newScheduleOption(func(opt *ScheduleOptions) {
+		opt.jobWrapper = func(p Picker, j Job) Job {
+			lp, ok := p.(*LevelPicker)
+			if !ok {
+				return j
+			}
+			return newJobLevelWrapper(lp.high, j)
+		}
+	})
+}
+
+func WithLowLevel() *scheduleOption {
+	return newScheduleOption(func(opt *ScheduleOptions) {
+		opt.jobWrapper = lowJobWrapperHandler
+	})
+}
+
+var lowJobWrapperHandler = func(p Picker, j Job) Job {
+	lp, ok := p.(*LevelPicker)
+	if !ok {
+		return j
+	}
+	return newJobLevelWrapper(lp.low, j)
+}
+
+type JobLevelWrapper struct {
+	l    JobLevel
+	next Job
+}
+
+func newJobLevelWrapper(jobLevel JobLevel, j Job) *JobLevelWrapper {
+	return &JobLevelWrapper{
+		l:    jobLevel,
+		next: j,
+	}
+}
+
+func (w *JobLevelWrapper) Run() {
+	w.next.Run()
+	w.l.Redo(e)
+}
+
+func (w *JobLevelWrapper) Distory() {
+	w.l.Remove(e)
+	w.next.Distory()
+}
+
+type LevelPicker struct {
+	low  JobLevel
+	high JobLevel
+}
+
+func NewLevelPicker() *LevelPicker {
+	lp := &LevelPicker{}
+	lp.low = NewLowLevel(c.location)
+	lp.high = NewHighLevel(c.location)
+	return lp
+}
+
+func (lp *LevelPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	jobs := make([]Job, 0, size)
+	for i := 0; i < size; {
+		select {
+		case job := <-lp.high.Pick():
+			if job != nil {
+				jobs = append(jobs, job)
+			}
+		default:
+			select {
+			case job := <-lp.high.Pick():
+				if job != nil {
+					jobs = append(jobs, job)
+				}
+			case job := <-lp.low.Pick():
+				if job != nil {
+					jobs = append(jobs, job)
+				}
+			case <-ctx.Done():
+				if ctx.Err() == context.DeadlineExceeded {
+					if len(jobs) == 0 {
+						continue
+					}
+				}
+				break // ctx.Err() == context.Canceled
+			}
+		}
+		i++
+	}
+	return jobs, len(jobs)
+}
 
 type highLevel struct {
 	timer    *Timer

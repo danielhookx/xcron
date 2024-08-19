@@ -9,13 +9,17 @@ import (
 
 type Job interface {
 	Run()
+	Distory()
 }
 
 type Picker interface {
 	PickSize(ctx context.Context, size int) ([]Job, int)
 }
 
-type Engine interface{}
+type Engine interface {
+	Start(ctx context.Context) error
+	Stop(ctx context.Context) error
+}
 
 type engine struct {
 	numWorkers int // work goroutine nums
