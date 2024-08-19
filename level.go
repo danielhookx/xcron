@@ -5,21 +5,14 @@ import (
 	"time"
 )
 
-type JobLevel interface {
-	Pick() <-chan Job
-	Remove(*Entry)
-	Add(*Entry)
-	Redo(*Entry)
-}
-
 func WithHighLevel() *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
-		opt.jobWrapper = func(p Picker, j Job) Job {
+		opt.jobWrapper = func(sc Schedule, p Picker, j Job) Job {
 			lp, ok := p.(*LevelPicker)
 			if !ok {
 				return j
 			}
-			return newJobLevelWrapper(lp.high, j)
+			return newJobLevelWrapper(sc, lp.high, j)
 		}
 	})
 }
@@ -30,33 +23,48 @@ func WithLowLevel() *scheduleOption {
 	})
 }
 
-var lowJobWrapperHandler = func(p Picker, j Job) Job {
+var lowJobWrapperHandler = func(sc Schedule, p Picker, j Job) Job {
 	lp, ok := p.(*LevelPicker)
 	if !ok {
 		return j
 	}
-	return newJobLevelWrapper(lp.low, j)
+	return newJobLevelWrapper(sc, lp.low, j)
+}
+
+type JobLevel interface {
+	Pick() <-chan Job
+	Remove(*JobLevelWrapper)
+	Add(*JobLevelWrapper)
+	Redo(*JobLevelWrapper)
 }
 
 type JobLevelWrapper struct {
-	l    JobLevel
+	l JobLevel
+
+	schedule Schedule
+
 	next Job
+
+	td *TimerData
 }
 
-func newJobLevelWrapper(jobLevel JobLevel, j Job) *JobLevelWrapper {
-	return &JobLevelWrapper{
-		l:    jobLevel,
-		next: j,
+func newJobLevelWrapper(sc Schedule, jobLevel JobLevel, j Job) *JobLevelWrapper {
+	w := &JobLevelWrapper{
+		l:        jobLevel,
+		schedule: sc,
+		next:     j,
 	}
+	jobLevel.Add(w)
+	return w
 }
 
 func (w *JobLevelWrapper) Run() {
 	w.next.Run()
-	w.l.Redo(e)
+	w.l.Redo(w)
 }
 
 func (w *JobLevelWrapper) Distory() {
-	w.l.Remove(e)
+	w.l.Remove(w)
 	w.next.Distory()
 }
 
@@ -65,11 +73,11 @@ type LevelPicker struct {
 	high JobLevel
 }
 
-func NewLevelPicker() *LevelPicker {
-	lp := &LevelPicker{}
-	lp.low = NewLowLevel(c.location)
-	lp.high = NewHighLevel(c.location)
-	return lp
+func NewLevelPicker(loc *time.Location) *LevelPicker {
+	return &LevelPicker{
+		low:  NewLowLevel(loc),
+		high: NewHighLevel(loc),
+	}
 }
 
 func (lp *LevelPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
@@ -127,17 +135,17 @@ func (h *highLevel) now() time.Time {
 	return time.Now().In(h.location)
 }
 
-func (h *highLevel) Remove(e *Entry) {
+func (h *highLevel) Remove(e *JobLevelWrapper) {
 	h.timer.Del(e.td)
 	e.td = nil
 }
 
-func (h *highLevel) Add(e *Entry) {
-	e.td = h.timer.Add(e.Schedule.Next(h.now()), e)
+func (h *highLevel) Add(e *JobLevelWrapper) {
+	e.td = h.timer.Add(e.schedule.Next(h.now()), e)
 }
 
-func (h *highLevel) Redo(e *Entry) {
-	h.timer.Set(e.td, e.Schedule.Next(h.now()))
+func (h *highLevel) Redo(e *JobLevelWrapper) {
+	h.timer.Set(e.td, e.schedule.Next(h.now()))
 }
 
 func (h *highLevel) Pick() <-chan Job {
@@ -164,17 +172,17 @@ func (l *lowLevel) now() time.Time {
 	return time.Now().In(l.location)
 }
 
-func (l *lowLevel) Remove(e *Entry) {
+func (l *lowLevel) Remove(e *JobLevelWrapper) {
 	l.timer.Del(e.td)
 	e.td = nil
 }
 
-func (l *lowLevel) Add(e *Entry) {
-	e.td = l.timer.Add(e.Schedule.Next(l.now()), e)
+func (l *lowLevel) Add(e *JobLevelWrapper) {
+	e.td = l.timer.Add(e.schedule.Next(l.now()), e)
 }
 
-func (l *lowLevel) Redo(e *Entry) {
-	l.timer.Set(e.td, e.Schedule.Next(l.now()))
+func (l *lowLevel) Redo(e *JobLevelWrapper) {
+	l.timer.Set(e.td, e.schedule.Next(l.now()))
 }
 
 func (l *lowLevel) Pick() <-chan Job {

@@ -12,6 +12,8 @@ type FuncJob func()
 
 func (f FuncJob) Run() { f() }
 
+func (f FuncJob) Distory() {}
+
 // Schedule describes a job's duty cycle.
 type Schedule interface {
 	// Next returns the next activation time, later than the given time.
@@ -22,8 +24,10 @@ type Schedule interface {
 type EngineCreator func(Picker) Engine
 type PickerCreator func() Picker
 
-var defaultPickerCreator PickerCreator = func() Picker {
-	return NewEngine(1, p)
+var defaultPickerCreatorHandler = func(loc *time.Location) PickerCreator {
+	return func() Picker {
+		return NewLevelPicker(loc)
+	}
 }
 
 var defaultEngineCreator EngineCreator = func(p Picker) Engine {
@@ -33,26 +37,9 @@ var defaultEngineCreator EngineCreator = func(p Picker) Engine {
 // EntryID identifies an entry within a Cron instance
 type EntryID string
 
-// Entry consists of a schedule and the func to execute on that schedule.
-type Entry struct {
-	// ID is the cron-assigned ID of this entry, which may be used to look up a
-	// snapshot or remove it.
-	ID EntryID
-
-	// Schedule on which this job should be run.
-	Schedule Schedule
-
-	td   *TimerData
-	next Job
-}
-
-func (e *Entry) Run() {
-	e.next.Run()
-}
-
 type Cron struct {
 	lock     sync.Mutex
-	entrys   map[EntryID]*Entry
+	entrys   map[EntryID]Job
 	engine   Engine
 	picker   Picker
 	location *time.Location
@@ -61,15 +48,19 @@ type Cron struct {
 
 func NewCron(opt ...CronOption) *Cron {
 	opts := CronOptions{
+		loc:           time.Local,
 		engineCreator: defaultEngineCreator,
 	}
 	for _, o := range opt {
 		o.apply(&opts)
 	}
 
+	if opts.pickerCreator == nil {
+		opts.pickerCreator = defaultPickerCreatorHandler(opts.loc)
+	}
 	c := &Cron{
-		entrys:   make(map[EntryID]*Entry),
-		location: time.Local,
+		entrys:   make(map[EntryID]Job),
+		location: opts.loc,
 	}
 	c.picker = opts.pickerCreator()
 	c.engine = opts.engineCreator(c.picker)
@@ -94,14 +85,12 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) Entry
 
 	c.lock.Lock()
 	c.index++
-	e := &Entry{
-		ID:       EntryID(strconv.Itoa(c.index)),
-		Schedule: schedule,
-		next:     opts.jobWrapper(c.picker, cmd),
+	if opts.id == "" {
+		opts.id = EntryID(strconv.Itoa(c.index))
 	}
-	c.entrys[e.ID] = e
+	c.entrys[opts.id] = opts.jobWrapper(schedule, c.picker, cmd)
 	c.lock.Unlock()
-	return e.ID
+	return opts.id
 }
 
 func (c *Cron) Remove(id EntryID) {
@@ -110,6 +99,6 @@ func (c *Cron) Remove(id EntryID) {
 	delete(c.entrys, id)
 	c.lock.Unlock()
 	if e != nil {
-		e.next.Distory()
+		e.Distory()
 	}
 }

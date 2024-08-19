@@ -16,12 +16,15 @@ func (t testJob) Run() {
 	t.wg.Done()
 }
 
+func (t testJob) Distory() {
+}
+
 func TestJob(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
 	ctx := context.Background()
-	cron := NewCron(1)
+	cron := NewCron()
 	cron.Schedule(Every(5*time.Second), testJob{wg, "job4"})
 
 	cron.Start(ctx)

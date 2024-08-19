@@ -1,6 +1,9 @@
 package xcron
 
+import "time"
+
 type CronOptions struct {
+	loc           *time.Location
 	pickerCreator PickerCreator
 	engineCreator EngineCreator
 }
@@ -23,6 +26,12 @@ func newCronOption(f func(*CronOptions)) *cronOption {
 	}
 }
 
+func WithLocation(loc *time.Location) *cronOption {
+	return newCronOption(func(opt *CronOptions) {
+		opt.loc = loc
+	})
+}
+
 func WithEngine(ec EngineCreator) *cronOption {
 	return newCronOption(func(opt *CronOptions) {
 		opt.engineCreator = ec
@@ -37,7 +46,7 @@ func WithPicker(pc PickerCreator) *cronOption {
 
 type ScheduleOptions struct {
 	id         EntryID
-	jobWrapper func(Picker, Job) Job
+	jobWrapper func(Schedule, Picker, Job) Job
 }
 
 type ScheduleOption interface {
@@ -61,5 +70,11 @@ func newScheduleOption(f func(*ScheduleOptions)) *scheduleOption {
 func WithID(id EntryID) *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
 		opt.id = id
+	})
+}
+
+func WithJobWrapper(jobWrapper func(Schedule, Picker, Job) Job) *scheduleOption {
+	return newScheduleOption(func(opt *ScheduleOptions) {
+		opt.jobWrapper = jobWrapper
 	})
 }
