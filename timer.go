@@ -1,3 +1,8 @@
+// This code is based on work from the goim project
+//
+// Source: https://github.com/Terry-Mao/goim/blob/master/pkg/time/timer.go
+// Original author: Terry.Mao
+// Licensed under the MIT License: https://opensource.org/licenses/MIT
 package xcron
 
 import (

@@ -3,9 +3,10 @@ package xcron
 import "time"
 
 type CronOptions struct {
-	loc           *time.Location
-	pickerCreator PickerCreator
-	engineCreator EngineCreator
+	loc            *time.Location
+	pickerCreator  PickerCreator
+	engineCreator  EngineCreator
+	scheduleParser ScheduleParser
 }
 
 type CronOption interface {
@@ -44,9 +45,15 @@ func WithPicker(pc PickerCreator) *cronOption {
 	})
 }
 
+func WithParser(sp ScheduleParser) *cronOption {
+	return newCronOption(func(opt *CronOptions) {
+		opt.scheduleParser = sp
+	})
+}
+
 type ScheduleOptions struct {
 	id         EntryID
-	jobWrapper func(Schedule, Picker, Job) Job
+	jobWrapper func(Schedule, Picker, Job) (Job, CancelHandler)
 }
 
 type ScheduleOption interface {
@@ -73,7 +80,7 @@ func WithID(id EntryID) *scheduleOption {
 	})
 }
 
-func WithJobWrapper(jobWrapper func(Schedule, Picker, Job) Job) *scheduleOption {
+func WithJobWrapper(jobWrapper func(Schedule, Picker, Job) (Job, CancelHandler)) *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
 		opt.jobWrapper = jobWrapper
 	})

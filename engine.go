@@ -2,91 +2,116 @@ package xcron
 
 import (
 	"context"
-	"log"
-	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
-)
 
-type Job interface {
-	Run()
-	Distory()
-}
+	"github.com/panjf2000/ants/v2"
+)
 
 type Picker interface {
 	PickSize(ctx context.Context, size int) ([]Job, int)
 }
 
 type Engine interface {
-	Start(ctx context.Context) error
-	Stop(ctx context.Context) error
+	Start() error
+	Stop() (context.Context, error)
 }
 
 type engine struct {
-	numWorkers int // work goroutine nums
+	maxWorkers, rate int // work goroutine nums
+	pool             *ants.Pool
+	picker           Picker
+	ticker           *time.Ticker
 
-	picker   Picker
-	taskChan chan Job
-	ticker   *time.Ticker
+	isRunning *atomic.Bool
+	cancel    func()
+	wg        *sync.WaitGroup
 }
 
-func NewEngine(numWorkers int, picker Picker) *engine {
-	tickerDuraction := time.Millisecond * 50 * time.Duration(numWorkers)
+func NewEngine(maxWorkers, rate int, picker Picker) *engine {
+	pool, err := ants.NewPool(maxWorkers)
+	if err != nil {
+		panic(err)
+	}
+	var ticker *time.Ticker
+	if rate > 0 {
+		ticker = time.NewTicker(time.Second / time.Duration(rate))
+	}
 	task := &engine{
-		numWorkers: numWorkers,
+		maxWorkers: maxWorkers,
+		rate:       rate,
+		pool:       pool,
 		picker:     picker,
-		taskChan:   make(chan Job, numWorkers),
-		ticker:     time.NewTicker(tickerDuraction),
+		ticker:     ticker,
+		isRunning:  &atomic.Bool{},
+		wg:         &sync.WaitGroup{},
 	}
 	return task
 }
 
-func (e *engine) Start(ctx context.Context) error {
-	go func(ctx context.Context) {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-e.ticker.C:
-				// Main loop, timed batch processing tasks
-				jobs, _ := e.picker.PickSize(ctx, e.numWorkers)
-				for _, job := range jobs {
-					if job != nil {
-						e.taskChan <- job
-					}
-				}
+func (e *engine) Start() error {
+	if e.isRunning.CompareAndSwap(false, true) {
+		ctx, cancel := context.WithCancel(context.Background())
+		e.cancel = cancel
+		go func() {
+			if e.ticker != nil {
+				e.doTicker(ctx)
+			} else {
+				e.doRange(ctx)
+			}
+		}()
+	}
+	return nil
+}
+
+func (e *engine) doTicker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.ticker.C:
+			jobs, _ := e.picker.PickSize(ctx, 1)
+			for _, job := range jobs {
+				e.wg.Add(1)
+				e.pool.Submit(func() {
+					job.Run()
+					e.wg.Done()
+				})
 			}
 		}
-	}(ctx)
+	}
+}
 
-	// work goroutines
-	for i := 0; i < e.numWorkers; i++ {
-		go func(ctx context.Context) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case job := <-e.taskChan:
-					if job != nil {
-						defer Recover()
-
-						job.Run()
-					}
-				}
+func (e *engine) doRange(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			jobs, _ := e.picker.PickSize(ctx, 1)
+			for _, job := range jobs {
+				e.wg.Add(1)
+				e.pool.Submit(func() {
+					job.Run()
+					e.wg.Done()
+				})
 			}
-		}(ctx)
+		}
 	}
-	return nil
 }
 
-func (e *engine) Stop(ctx context.Context) error {
-	e.ticker.Stop()
-	return nil
-}
-
-func Recover() {
-	if rerr := recover(); rerr != nil {
-		buf := make([]byte, 64<<10) //nolint:gomnd
-		n := runtime.Stack(buf, false)
-		log.Printf("panic %v: \n%s\n", rerr, buf[:n])
+func (e *engine) Stop() (context.Context, error) {
+	if e.isRunning.CompareAndSwap(true, false) {
+		if e.ticker != nil {
+			e.ticker.Stop()
+		}
+		e.cancel()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		e.wg.Wait()
+		cancel()
+	}()
+	return ctx, nil
 }

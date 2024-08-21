@@ -2,17 +2,19 @@ package xcron
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 func WithHighLevel() *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
-		opt.jobWrapper = func(sc Schedule, p Picker, j Job) Job {
+		opt.jobWrapper = func(sc Schedule, p Picker, j Job) (Job, CancelHandler) {
 			lp, ok := p.(*LevelPicker)
 			if !ok {
-				return j
+				return j, func() {}
 			}
-			return newJobLevelWrapper(sc, lp.high, j)
+			return newJobLevelWrapper(lp, lp.high, sc, j)
 		}
 	})
 }
@@ -23,12 +25,12 @@ func WithLowLevel() *scheduleOption {
 	})
 }
 
-var lowJobWrapperHandler = func(sc Schedule, p Picker, j Job) Job {
+var lowJobWrapperHandler = func(sc Schedule, p Picker, j Job) (Job, CancelHandler) {
 	lp, ok := p.(*LevelPicker)
 	if !ok {
-		return j
+		return j, func() {}
 	}
-	return newJobLevelWrapper(sc, lp.low, j)
+	return newJobLevelWrapper(lp, lp.low, sc, j)
 }
 
 type JobLevel interface {
@@ -48,40 +50,46 @@ type JobLevelWrapper struct {
 	td *TimerData
 }
 
-func newJobLevelWrapper(sc Schedule, jobLevel JobLevel, j Job) *JobLevelWrapper {
+func newJobLevelWrapper(lp *LevelPicker, l JobLevel, sc Schedule, j Job) (*JobLevelWrapper, CancelHandler) {
 	w := &JobLevelWrapper{
-		l:        jobLevel,
+		l:        l,
 		schedule: sc,
 		next:     j,
+		td:       &TimerData{},
 	}
-	jobLevel.Add(w)
-	return w
+	lp.Add(w, func() {
+		w.l.Add(w)
+	})
+	return w, func() {
+		w.l.Remove(w)
+		lp.Del(w)
+	}
 }
 
 func (w *JobLevelWrapper) Run() {
-	w.next.Run()
 	w.l.Redo(w)
-}
-
-func (w *JobLevelWrapper) Distory() {
-	w.l.Remove(w)
-	w.next.Distory()
+	w.next.Run()
 }
 
 type LevelPicker struct {
+	sync.Mutex
+	running          atomic.Bool
+	waittingSchedule map[Job]func()
+
 	low  JobLevel
 	high JobLevel
 }
 
 func NewLevelPicker(loc *time.Location) *LevelPicker {
 	return &LevelPicker{
-		low:  NewLowLevel(loc),
-		high: NewHighLevel(loc),
+		waittingSchedule: make(map[Job]func(), 0),
+		low:              newLowLevel(loc),
+		high:             newHighLevel(loc),
 	}
 }
 
 func (lp *LevelPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 
 	jobs := make([]Job, 0, size)
@@ -107,6 +115,9 @@ func (lp *LevelPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
 						continue
 					}
 				}
+				if ctx.Err() == context.Canceled {
+					return nil, -1
+				}
 				break // ctx.Err() == context.Canceled
 			}
 		}
@@ -115,13 +126,50 @@ func (lp *LevelPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
 	return jobs, len(jobs)
 }
 
+func (lp *LevelPicker) Add(j Job, fn func()) error {
+	if !lp.running.Load() {
+		lp.Lock()
+		defer lp.Unlock()
+		lp.waittingSchedule[j] = fn
+		return nil
+	}
+	fn()
+	return nil
+}
+
+func (lp *LevelPicker) Del(j Job) {
+	lp.Lock()
+	defer lp.Unlock()
+	delete(lp.waittingSchedule, j)
+}
+
+func (lp *LevelPicker) Start() error {
+	if lp.running.CompareAndSwap(false, true) {
+		lp.Lock()
+		defer lp.Unlock()
+		for _, fn := range lp.waittingSchedule {
+			fn()
+		}
+	}
+	return nil
+}
+
+func (lp *LevelPicker) Stop() error {
+	if lp.running.CompareAndSwap(true, false) {
+		lp.Lock()
+		defer lp.Unlock()
+		lp.waittingSchedule = make(map[Job]func())
+	}
+	return nil
+}
+
 type highLevel struct {
 	timer    *Timer
 	ready    chan Job
 	location *time.Location
 }
 
-func NewHighLevel(location *time.Location) *highLevel {
+func newHighLevel(location *time.Location) *highLevel {
 	ready := make(chan Job, 10)
 	h := &highLevel{
 		timer:    NewTimer(10, ready),
@@ -141,7 +189,12 @@ func (h *highLevel) Remove(e *JobLevelWrapper) {
 }
 
 func (h *highLevel) Add(e *JobLevelWrapper) {
-	e.td = h.timer.Add(e.schedule.Next(h.now()), e)
+	now := h.now()
+	next := e.schedule.Next(now)
+	if next.Before(now) {
+		return
+	}
+	e.td = h.timer.Add(next, e)
 }
 
 func (h *highLevel) Redo(e *JobLevelWrapper) {
@@ -158,7 +211,7 @@ type lowLevel struct {
 	location *time.Location
 }
 
-func NewLowLevel(location *time.Location) *lowLevel {
+func newLowLevel(location *time.Location) *lowLevel {
 	ready := make(chan Job, 10)
 	l := &lowLevel{
 		timer:    NewTimer(10, ready),
@@ -178,7 +231,12 @@ func (l *lowLevel) Remove(e *JobLevelWrapper) {
 }
 
 func (l *lowLevel) Add(e *JobLevelWrapper) {
-	e.td = l.timer.Add(e.schedule.Next(l.now()), e)
+	now := l.now()
+	next := e.schedule.Next(now)
+	if next.Before(now) {
+		return
+	}
+	e.td = l.timer.Add(next, e)
 }
 
 func (l *lowLevel) Redo(e *JobLevelWrapper) {
