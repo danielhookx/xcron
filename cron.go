@@ -7,10 +7,19 @@ import (
 	"time"
 )
 
-// FuncJob is a wrapper that turns a func() into a cron.Job
+// FuncJob is a wrapper that turns a func() into a Job
 type FuncJob func()
 
 func (f FuncJob) Run() { f() }
+
+type Job interface {
+	Run()
+}
+
+// ScheduleParser is an interface for schedule spec parsers that return a Schedule
+type ScheduleParser interface {
+	Parse(spec string) (Schedule, error)
+}
 
 // Schedule describes a job's duty cycle.
 type Schedule interface {
@@ -19,180 +28,150 @@ type Schedule interface {
 	Next(time.Time) time.Time
 }
 
-type JobLevel interface {
-	Pick() <-chan Job
-	Remove(*Entry)
-	Add(*Entry)
-	Redo(*Entry)
+type JobPicker interface {
+	Picker
+	Start() error
+	Stop() error
 }
 
-type Level int
+type EngineCreator func(Picker) Engine
+type PickerCreator func() JobPicker
 
-const (
-	LowLevel Level = iota
-	HighLevel
-)
+var defaultPickerCreatorHandler = func(loc *time.Location) PickerCreator {
+	return func() JobPicker {
+		return NewLevelPicker(loc)
+	}
+}
+
+var defaultEngineCreator EngineCreator = func(p Picker) Engine {
+	return NewEngine(0, 0, p)
+}
+
+type CancelHandler func()
 
 // EntryID identifies an entry within a Cron instance
 type EntryID string
 
-// Entry consists of a schedule and the func to execute on that schedule.
 type Entry struct {
-	// ID is the cron-assigned ID of this entry, which may be used to look up a
-	// snapshot or remove it.
-	ID EntryID
-
-	// Schedule on which this job should be run.
-	Schedule Schedule
-
-	l    JobLevel
-	td   *TimerData
-	next Job
-}
-
-func (e *Entry) Run() {
-	e.next.Run()
-	e.l.Redo(e)
-}
-
-type ScheduleOptions struct {
-	id    EntryID
-	level Level
-}
-
-type ScheduleOption interface {
-	apply(*ScheduleOptions)
-}
-
-type scheduleOption struct {
-	f func(opts *ScheduleOptions)
-}
-
-func (o *scheduleOption) apply(opts *ScheduleOptions) {
-	o.f(opts)
-}
-
-func newScheduleOption(f func(*ScheduleOptions)) *scheduleOption {
-	return &scheduleOption{
-		f: f,
-	}
-}
-
-func WithLevel(level Level) *scheduleOption {
-	return newScheduleOption(func(opt *ScheduleOptions) {
-		opt.level = level
-	})
-}
-
-func WithID(id EntryID) *scheduleOption {
-	return newScheduleOption(func(opt *ScheduleOptions) {
-		opt.id = id
-	})
+	Job
+	cancel CancelHandler
 }
 
 type Cron struct {
 	lock     sync.Mutex
-	entrys   map[EntryID]*Entry
-	engine   *engine
-	low      JobLevel
-	high     JobLevel
+	entries  map[EntryID]*Entry
+	engine   Engine
+	picker   JobPicker
+	parser   ScheduleParser
 	location *time.Location
 	index    int
 }
 
-func NewCron(numWorkers int) *Cron {
-	tm := &Cron{
-		entrys:   make(map[EntryID]*Entry),
-		location: time.Local,
-	}
-	tm.low = NewLowLevel(tm.location)
-	tm.high = NewHighLevel(tm.location)
-	tm.engine = NewEngine(numWorkers, tm)
-	return tm
-}
-
-func (m *Cron) Start(ctx context.Context) error {
-	return m.engine.Start(ctx)
-}
-
-func (m *Cron) Stop(ctx context.Context) error {
-	return m.engine.Stop(ctx)
-}
-
-func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) EntryID {
-	opts := ScheduleOptions{
-		level: LowLevel,
+func NewCron(opt ...CronOption) *Cron {
+	opts := CronOptions{
+		loc:            time.Local,
+		engineCreator:  defaultEngineCreator,
+		scheduleParser: standardParser,
 	}
 	for _, o := range opt {
 		o.apply(&opts)
 	}
 
-	l := c.jobLevel(opts.level)
+	if opts.pickerCreator == nil {
+		opts.pickerCreator = defaultPickerCreatorHandler(opts.loc)
+	}
+	c := &Cron{
+		entries:  make(map[EntryID]*Entry),
+		location: opts.loc,
+		parser:   opts.scheduleParser,
+	}
+	c.picker = opts.pickerCreator()
+	c.engine = opts.engineCreator(c.picker)
+	return c
+}
+
+func (m *Cron) Start() error {
+	var err error
+	if e := m.picker.Start(); e != nil {
+		err = e
+	}
+	if e := m.engine.Start(); e != nil {
+		err = e
+	}
+	return err
+}
+
+func (m *Cron) Stop() (context.Context, error) {
+	var err error
+	if e := m.picker.Stop(); e != nil {
+		err = e
+	}
+	ctx, e := m.engine.Stop()
+	if e != nil {
+		err = e
+	}
+	return ctx, err
+}
+
+// AddFunc adds a func to the Cron to be run on the given schedule.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// An ID is returned that can be used to later remove it.
+func (c *Cron) AddFunc(spec string, cmd func(), opt ...ScheduleOption) (EntryID, error) {
+	return c.AddJob(spec, FuncJob(cmd), opt...)
+}
+
+// AddJob adds a Job to the Cron to be run on the given schedule.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// An ID is returned that can be used to later remove it.
+func (c *Cron) AddJob(spec string, cmd Job, opt ...ScheduleOption) (EntryID, error) {
+	schedule, err := c.parser.Parse(spec)
+	if err != nil {
+		return "", err
+	}
+	return c.Schedule(schedule, cmd, opt...), nil
+}
+
+func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) EntryID {
+	opts := ScheduleOptions{
+		jobWrapper: lowJobWrapperHandler,
+	}
+	for _, o := range opt {
+		o.apply(&opts)
+	}
+
 	c.lock.Lock()
 	c.index++
-	e := &Entry{
-		ID:       EntryID(strconv.Itoa(c.index)),
-		Schedule: schedule,
-		next:     cmd,
-		l:        l,
+	if opts.id == "" {
+		opts.id = EntryID(strconv.Itoa(c.index))
 	}
-	c.entrys[e.ID] = e
+	j, cancel := opts.jobWrapper(schedule, c.picker, cmd)
+	c.entries[opts.id] = &Entry{
+		Job:    j,
+		cancel: cancel,
+	}
 	c.lock.Unlock()
-	l.Add(e)
-	return e.ID
+	return opts.id
+}
+
+// Location gets the time zone location
+func (c *Cron) Location() *time.Location {
+	return c.location
+}
+
+// Entry returns a snapshot of the given entry, or nil if it couldn't be found.
+func (c *Cron) Entry(id EntryID) *Entry {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	e := c.entries[id]
+	return e
 }
 
 func (c *Cron) Remove(id EntryID) {
 	c.lock.Lock()
-	e := c.entrys[id]
-	delete(c.entrys, id)
+	e := c.entries[id]
+	delete(c.entries, id)
 	c.lock.Unlock()
-	if e != nil {
-		e.l.Remove(e)
+	if e != nil && e.cancel != nil {
+		e.cancel()
 	}
-}
-
-func (c *Cron) jobLevel(l Level) JobLevel {
-	switch l {
-	case LowLevel:
-		return c.low
-	case HighLevel:
-		return c.high
-	}
-	return c.low
-}
-
-func (m *Cron) PickSize(ctx context.Context, size int) ([]Job, int) {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	jobs := make([]Job, 0, size)
-	for i := 0; i < size; {
-		select {
-		case job := <-m.high.Pick():
-			if job != nil {
-				jobs = append(jobs, job)
-			}
-		default:
-			select {
-			case job := <-m.high.Pick():
-				if job != nil {
-					jobs = append(jobs, job)
-				}
-			case job := <-m.low.Pick():
-				if job != nil {
-					jobs = append(jobs, job)
-				}
-			case <-ctx.Done():
-				if ctx.Err() == context.DeadlineExceeded {
-					if len(jobs) == 0 {
-						continue
-					}
-				}
-				break // ctx.Err() == context.Canceled
-			}
-		}
-		i++
-	}
-	return jobs, len(jobs)
 }
