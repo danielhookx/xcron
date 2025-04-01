@@ -53,7 +53,7 @@ func WithParser(sp ScheduleParser) *cronOption {
 
 type ScheduleOptions struct {
 	id         EntryID
-	jobWrapper func(Schedule, Picker, Job) (Job, CancelHandler)
+	jobWrapper func(Schedule, Job) (Job, CancelHandler)
 }
 
 type ScheduleOption interface {
@@ -80,7 +80,7 @@ func WithID(id EntryID) *scheduleOption {
 	})
 }
 
-func WithJobWrapper(jobWrapper func(Schedule, Picker, Job) (Job, CancelHandler)) *scheduleOption {
+func WithJobWrapper(jobWrapper func(Schedule, Job) (Job, CancelHandler)) *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
 		opt.jobWrapper = jobWrapper
 	})

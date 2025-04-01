@@ -9,10 +9,6 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
-type Picker interface {
-	PickSize(ctx context.Context, size int) ([]Job, int)
-}
-
 type Engine interface {
 	Start() error
 	Stop() (context.Context, error)

@@ -39,7 +39,7 @@ type PickerCreator func() JobPicker
 
 var defaultPickerCreatorHandler = func(loc *time.Location) PickerCreator {
 	return func() JobPicker {
-		return NewLevelPicker(loc)
+		return newPicker(loc)
 	}
 }
 
@@ -133,7 +133,7 @@ func (c *Cron) AddJob(spec string, cmd Job, opt ...ScheduleOption) (EntryID, err
 
 func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) EntryID {
 	opts := ScheduleOptions{
-		jobWrapper: lowJobWrapperHandler,
+		jobWrapper: warpJob(c.picker),
 	}
 	for _, o := range opt {
 		o.apply(&opts)
@@ -144,7 +144,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) Entry
 	if opts.id == "" {
 		opts.id = EntryID(strconv.Itoa(c.index))
 	}
-	j, cancel := opts.jobWrapper(schedule, c.picker, cmd)
+	j, cancel := opts.jobWrapper(schedule, cmd)
 	c.entries[opts.id] = &Entry{
 		Job:    j,
 		cancel: cancel,
