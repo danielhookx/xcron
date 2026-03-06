@@ -2,13 +2,16 @@ package xcron
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
+// Picker selects ready jobs from the scheduler.
+// Similar to io.Reader: pull-based, may return fewer than requested.
 type Picker interface {
-	PickSize(ctx context.Context, size int) ([]Job, int)
+	// Pick returns up to size ready jobs. Blocks until at least one is available
+	// or ctx is done. May return fewer than size if deadline exceeded.
+	// Returns (nil, ctx.Err()) when ctx is canceled.
+	Pick(ctx context.Context, size int) ([]Job, error)
 }
 
 func warpJob(picker Picker) func(Schedule, Job) (Job, CancelHandler) {
@@ -19,136 +22,97 @@ func warpJob(picker Picker) func(Schedule, Job) (Job, CancelHandler) {
 		}
 
 		wj := &job{
-			picker:   p,
-			next:     j,
-			schedule: schedule,
-			td:       &TimerData{},
+			scheduler: p.scheduler,
+			next:      j,
+			schedule:  schedule,
+			td:        &TimerData{},
 		}
-		p.add(wj)
+		p.scheduler.add(wj)
 		return wj, func() {
-			p.del(wj)
+			p.scheduler.del(wj)
 		}
 	}
 }
 
 type job struct {
-	picker   *defaultPicker
-	next     Job
-	td       *TimerData
-	schedule Schedule
+	scheduler *jobScheduler
+	next      Job
+	td        *TimerData
+	schedule  Schedule
 }
 
 func (j *job) Run() {
-	j.picker.redo(j)
+	j.scheduler.redo(j)
 	j.next.Run()
 }
 
 func (j *job) add() {
-	now := j.picker.now()
+	now := j.scheduler.now()
 	next := j.schedule.Next(now)
 	if next.Before(now) {
 		return
 	}
-	j.td = j.picker.timer.Add(next, j)
+	j.td = j.scheduler.timer.Add(next, j)
 }
 
 func (j *job) remove() {
-	j.picker.timer.Del(j.td)
+	j.scheduler.timer.Del(j.td)
 	j.td = nil
 }
 
-type defaultPicker struct {
-	sync.Mutex
-	running          atomic.Bool
-	waittingSchedule map[Job]func()
+const defaultPickTimeout = 5 * time.Millisecond
 
-	timer    *Timer
-	ready    chan Job
-	location *time.Location
+// defaultPicker implements Picker by reading from the scheduler's ready channel.
+// It delegates scheduling (when to trigger) to jobScheduler and only handles
+// selection (which/how many jobs to return).
+type defaultPicker struct {
+	scheduler   *jobScheduler
+	pickTimeout time.Duration
 }
 
 func newPicker(loc *time.Location) *defaultPicker {
-	ready := make(chan Job, 10)
+	return newPickerWithTimeout(loc, 0)
+}
+
+func newPickerWithTimeout(loc *time.Location, timeout time.Duration) *defaultPicker {
+	if timeout <= 0 {
+		timeout = defaultPickTimeout
+	}
 	return &defaultPicker{
-		waittingSchedule: make(map[Job]func()),
-		timer:            NewTimer(10, ready),
-		ready:            ready,
-		location:         loc,
+		scheduler:   newJobScheduler(loc),
+		pickTimeout: timeout,
 	}
 }
 
-func (s *defaultPicker) PickSize(ctx context.Context, size int) ([]Job, int) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
-	defer cancel()
-
+func (p *defaultPicker) Pick(ctx context.Context, size int) ([]Job, error) {
 	jobs := make([]Job, 0, size)
-	for i := 0; i < size; {
+	for len(jobs) < size {
+		pickCtx, cancel := context.WithTimeout(ctx, p.pickTimeout)
 		select {
-		case job := <-s.ready:
-			if job != nil {
-				jobs = append(jobs, job)
+		case j := <-p.scheduler.ready:
+			cancel()
+			if j != nil {
+				jobs = append(jobs, j)
 			}
-		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				if len(jobs) == 0 {
-					continue
-				}
+		case <-pickCtx.Done():
+			cancel()
+			if len(jobs) > 0 {
+				return jobs, nil
 			}
-			if ctx.Err() == context.Canceled {
-				return nil, -1
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
-			break // ctx.Err() == context.Canceled
-		}
-		i++
-	}
-	return jobs, len(jobs)
-}
-
-func (s *defaultPicker) Start() error {
-	if s.running.CompareAndSwap(false, true) {
-		s.Lock()
-		defer s.Unlock()
-		for _, fn := range s.waittingSchedule {
-			fn()
+			// pickCtx deadline exceeded, parent ctx still valid: retry
+			continue
 		}
 	}
-	return nil
+	return jobs, nil
 }
 
-func (s *defaultPicker) Stop() error {
-	if s.running.CompareAndSwap(true, false) {
-		s.Lock()
-		defer s.Unlock()
-		s.waittingSchedule = make(map[Job]func())
-	}
-	return nil
+func (p *defaultPicker) Start() error {
+	return p.scheduler.Start()
 }
 
-func (s *defaultPicker) add(j *job) error {
-	if !s.running.Load() {
-		s.Lock()
-		defer s.Unlock()
-		s.waittingSchedule[j] = func() {
-			j.add()
-		}
-		return nil
-	}
-	j.add()
-	return nil
-}
-
-func (s *defaultPicker) del(j *job) {
-	s.Lock()
-	delete(s.waittingSchedule, j)
-	s.Unlock()
-
-	j.remove()
-}
-
-func (s *defaultPicker) redo(j *job) {
-	s.timer.Set(j.td, j.schedule.Next(s.now()))
-}
-
-func (s *defaultPicker) now() time.Time {
-	return time.Now().In(s.location)
+func (p *defaultPicker) Stop() error {
+	return p.scheduler.Stop()
 }

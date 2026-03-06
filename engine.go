@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/panjf2000/ants/v2"
 )
@@ -15,10 +14,9 @@ type Engine interface {
 }
 
 type engine struct {
-	maxWorkers, rate int // work goroutine nums
-	pool             *ants.Pool
-	picker           Picker
-	ticker           *time.Ticker
+	pool     *ants.Pool
+	picker   Picker
+	strategy PacingStrategy
 
 	isRunning *atomic.Bool
 	cancel    func()
@@ -30,78 +28,44 @@ func NewEngine(maxWorkers, rate int, picker Picker) *engine {
 	if err != nil {
 		panic(err)
 	}
-	var ticker *time.Ticker
-	if rate > 0 {
-		ticker = time.NewTicker(time.Second / time.Duration(rate))
+	return &engine{
+		pool:     pool,
+		picker:   picker,
+		strategy: NewPacingStrategy(rate),
+		isRunning: &atomic.Bool{},
+		wg:       &sync.WaitGroup{},
 	}
-	task := &engine{
-		maxWorkers: maxWorkers,
-		rate:       rate,
-		pool:       pool,
-		picker:     picker,
-		ticker:     ticker,
-		isRunning:  &atomic.Bool{},
-		wg:         &sync.WaitGroup{},
-	}
-	return task
 }
 
 func (e *engine) Start() error {
 	if e.isRunning.CompareAndSwap(false, true) {
 		ctx, cancel := context.WithCancel(context.Background())
 		e.cancel = cancel
-		go func() {
-			if e.ticker != nil {
-				e.doTicker(ctx)
-			} else {
-				e.doRange(ctx)
-			}
-		}()
+		go e.run(ctx)
 	}
 	return nil
 }
 
-func (e *engine) doTicker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
+func (e *engine) run(ctx context.Context) {
+	for e.strategy.WaitForNext(ctx) {
+		jobs, err := e.picker.Pick(ctx, 1)
+		if err != nil {
 			return
-		case <-e.ticker.C:
-			jobs, _ := e.picker.PickSize(ctx, 1)
-			for _, job := range jobs {
-				e.wg.Add(1)
-				e.pool.Submit(func() {
-					job.Run()
-					e.wg.Done()
-				})
-			}
 		}
-	}
-}
-
-func (e *engine) doRange(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			jobs, _ := e.picker.PickSize(ctx, 1)
-			for _, job := range jobs {
-				e.wg.Add(1)
-				e.pool.Submit(func() {
-					job.Run()
-					e.wg.Done()
-				})
-			}
+		for _, job := range jobs {
+			e.wg.Add(1)
+			j := job
+			e.pool.Submit(func() {
+				j.Run()
+				e.wg.Done()
+			})
 		}
 	}
 }
 
 func (e *engine) Stop() (context.Context, error) {
 	if e.isRunning.CompareAndSwap(true, false) {
-		if e.ticker != nil {
-			e.ticker.Stop()
-		}
+		e.strategy.Stop()
 		e.cancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())

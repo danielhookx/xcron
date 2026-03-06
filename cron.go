@@ -37,15 +37,12 @@ type JobPicker interface {
 type EngineCreator func(Picker) Engine
 type PickerCreator func() JobPicker
 
-var defaultPickerCreatorHandler = func(loc *time.Location) PickerCreator {
+func defaultPickerCreator(opts *CronOptions) PickerCreator {
 	return func() JobPicker {
-		return newPicker(loc)
+		return newPickerWithTimeout(opts.loc, opts.pickTimeout)
 	}
 }
 
-var defaultEngineCreator EngineCreator = func(p Picker) Engine {
-	return NewEngine(0, 0, p)
-}
 
 type CancelHandler func()
 
@@ -70,7 +67,6 @@ type Cron struct {
 func NewCron(opt ...CronOption) *Cron {
 	opts := CronOptions{
 		loc:            time.Local,
-		engineCreator:  defaultEngineCreator,
 		scheduleParser: standardParser,
 	}
 	for _, o := range opt {
@@ -78,7 +74,7 @@ func NewCron(opt ...CronOption) *Cron {
 	}
 
 	if opts.pickerCreator == nil {
-		opts.pickerCreator = defaultPickerCreatorHandler(opts.loc)
+		opts.pickerCreator = defaultPickerCreator(&opts)
 	}
 	c := &Cron{
 		entries:  make(map[EntryID]*Entry),
@@ -86,7 +82,11 @@ func NewCron(opt ...CronOption) *Cron {
 		parser:   opts.scheduleParser,
 	}
 	c.picker = opts.pickerCreator()
-	c.engine = opts.engineCreator(c.picker)
+	if opts.engineCreator != nil {
+		c.engine = opts.engineCreator(c.picker)
+	} else {
+		c.engine = NewEngine(opts.engineConfig.MaxWorkers, opts.engineConfig.Rate, c.picker)
+	}
 	return c
 }
 
