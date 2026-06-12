@@ -10,11 +10,8 @@ type EngineConfig struct {
 
 type CronOptions struct {
 	loc            *time.Location
-	pickerCreator  PickerCreator
-	engineCreator  EngineCreator // nil means use engineConfig to create default Engine
-	engineConfig   EngineConfig
+	engine         Engine // nil means use engineConfig to create default Engine
 	scheduleParser ScheduleParser
-	pickTimeout    time.Duration // timeout for Pick when no jobs ready, 0 means use default
 }
 
 type CronOption interface {
@@ -41,32 +38,9 @@ func WithLocation(loc *time.Location) *cronOption {
 	})
 }
 
-func WithEngine(ec EngineCreator) *cronOption {
+func WithEngine(engine Engine) *cronOption {
 	return newCronOption(func(opt *CronOptions) {
-		opt.engineCreator = ec
-	})
-}
-
-// WithEngineConfig configures Engine concurrency and execution rate.
-// Takes effect when WithEngine is not used to specify a custom Engine.
-func WithEngineConfig(maxWorkers, rate int) *cronOption {
-	return newCronOption(func(opt *CronOptions) {
-		opt.engineConfig.MaxWorkers = maxWorkers
-		opt.engineConfig.Rate = rate
-	})
-}
-
-func WithPicker(pc PickerCreator) *cronOption {
-	return newCronOption(func(opt *CronOptions) {
-		opt.pickerCreator = pc
-	})
-}
-
-// WithPickTimeout sets the timeout for Pick when waiting for ready jobs.
-// Only applies when using the default picker. Zero means use default (5ms).
-func WithPickTimeout(d time.Duration) *cronOption {
-	return newCronOption(func(opt *CronOptions) {
-		opt.pickTimeout = d
+		opt.engine = engine
 	})
 }
 
@@ -78,7 +52,7 @@ func WithParser(sp ScheduleParser) *cronOption {
 
 type ScheduleOptions struct {
 	id         EntryID
-	jobWrapper func(Schedule, Job) (Job, CancelHandler)
+	jobWrapper JobWrapper
 }
 
 type ScheduleOption interface {
@@ -105,7 +79,7 @@ func WithID(id EntryID) *scheduleOption {
 	})
 }
 
-func WithJobWrapper(jobWrapper func(Schedule, Job) (Job, CancelHandler)) *scheduleOption {
+func WithJobWrapper(jobWrapper JobWrapper) *scheduleOption {
 	return newScheduleOption(func(opt *ScheduleOptions) {
 		opt.jobWrapper = jobWrapper
 	})

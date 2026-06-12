@@ -28,21 +28,13 @@ type Schedule interface {
 	Next(time.Time) time.Time
 }
 
-type JobPicker interface {
-	Picker
+type Engine interface {
+	JobWrapper() JobWrapper
 	Start() error
-	Stop() error
+	Stop() (context.Context, error)
 }
 
-type EngineCreator func(Picker) Engine
-type PickerCreator func() JobPicker
-
-func defaultPickerCreator(opts *CronOptions) PickerCreator {
-	return func() JobPicker {
-		return newPickerWithTimeout(opts.loc, opts.pickTimeout)
-	}
-}
-
+type JobWrapper func(Schedule, Job) (Job, CancelHandler)
 
 type CancelHandler func()
 
@@ -58,7 +50,6 @@ type Cron struct {
 	lock     sync.Mutex
 	entries  map[EntryID]*Entry
 	engine   Engine
-	picker   JobPicker
 	parser   ScheduleParser
 	location *time.Location
 	index    int
@@ -73,44 +64,25 @@ func NewCron(opt ...CronOption) *Cron {
 		o.apply(&opts)
 	}
 
-	if opts.pickerCreator == nil {
-		opts.pickerCreator = defaultPickerCreator(&opts)
-	}
 	c := &Cron{
 		entries:  make(map[EntryID]*Entry),
 		location: opts.loc,
 		parser:   opts.scheduleParser,
 	}
-	c.picker = opts.pickerCreator()
-	if opts.engineCreator != nil {
-		c.engine = opts.engineCreator(c.picker)
+	if opts.engine != nil {
+		c.engine = opts.engine
 	} else {
-		c.engine = NewEngine(opts.engineConfig.MaxWorkers, opts.engineConfig.Rate, c.picker)
+		c.engine = NewEngine(NewJobScheduler(opts.loc))
 	}
 	return c
 }
 
 func (m *Cron) Start() error {
-	var err error
-	if e := m.picker.Start(); e != nil {
-		err = e
-	}
-	if e := m.engine.Start(); e != nil {
-		err = e
-	}
-	return err
+	return m.engine.Start()
 }
 
 func (m *Cron) Stop() (context.Context, error) {
-	var err error
-	if e := m.picker.Stop(); e != nil {
-		err = e
-	}
-	ctx, e := m.engine.Stop()
-	if e != nil {
-		err = e
-	}
-	return ctx, err
+	return m.engine.Stop()
 }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
@@ -133,7 +105,7 @@ func (c *Cron) AddJob(spec string, cmd Job, opt ...ScheduleOption) (EntryID, err
 
 func (c *Cron) Schedule(schedule Schedule, cmd Job, opt ...ScheduleOption) EntryID {
 	opts := ScheduleOptions{
-		jobWrapper: warpJob(c.picker),
+		jobWrapper: c.engine.JobWrapper(),
 	}
 	for _, o := range opt {
 		o.apply(&opts)

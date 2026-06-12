@@ -1,10 +1,69 @@
 package xcron
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+const defaultPickTimeout = 5 * time.Millisecond
+
+type job struct {
+	scheduler *jobScheduler
+	next      Job
+	td        *TimerData
+	schedule  Schedule
+}
+
+func (j *job) Run() {
+	j.scheduler.redo(j)
+	j.next.Run()
+}
+
+func (j *job) add() {
+	now := j.scheduler.now()
+	next := j.schedule.Next(now)
+	if next.Before(now) {
+		return
+	}
+	j.td = j.scheduler.timer.Add(next, j)
+}
+
+func (j *job) remove() {
+	j.scheduler.timer.Del(j.td)
+	j.td = nil
+}
+
+var _ Scheduler = (*jobScheduler)(nil)
+
+type JobSchedulerOptions struct {
+	timeout time.Duration // pick timeout, 0 means use default
+}
+
+type JobSchedulerOption interface {
+	apply(*JobSchedulerOptions)
+}
+
+type jobSchedulerOption struct {
+	f func(opts *JobSchedulerOptions)
+}
+
+func (o *jobSchedulerOption) apply(opts *JobSchedulerOptions) {
+	o.f(opts)
+}
+
+func newJobSchedulerOption(f func(*JobSchedulerOptions)) *jobSchedulerOption {
+	return &jobSchedulerOption{
+		f: f,
+	}
+}
+
+func WithPickTimeout(timeout time.Duration) *jobSchedulerOption {
+	return newJobSchedulerOption(func(opt *JobSchedulerOptions) {
+		opt.timeout = timeout
+	})
+}
 
 // jobScheduler manages when jobs are due and pushes them to the ready channel.
 // It holds the Timer, waiting schedule, and lifecycle (Start/Stop).
@@ -16,16 +75,67 @@ type jobScheduler struct {
 	timer    *Timer
 	ready    chan Job
 	location *time.Location
+	timeout  time.Duration
 }
 
-func newJobScheduler(loc *time.Location) *jobScheduler {
+func NewJobScheduler(loc *time.Location, opt ...JobSchedulerOption) *jobScheduler {
+	opts := JobSchedulerOptions{
+		timeout: defaultPickTimeout,
+	}
+	for _, o := range opt {
+		o.apply(&opts)
+	}
 	ready := make(chan Job, 10)
 	return &jobScheduler{
 		waitingSchedule: make(map[Job]func()),
 		timer:           NewTimer(10, ready),
 		ready:           ready,
 		location:        loc,
+		timeout:         opts.timeout,
 	}
+}
+
+func (s *jobScheduler) JobWrapper() JobWrapper {
+	return func(schedule Schedule, j Job) (Job, CancelHandler) {
+		wj := &job{
+			scheduler: s,
+			next:      j,
+			schedule:  schedule,
+			td:        &TimerData{},
+		}
+		s.add(wj)
+		return wj, func() {
+			s.del(wj)
+		}
+	}
+}
+
+// Pick implements Picker by reading from the scheduler's ready channel.
+// It delegates scheduling (when to trigger) to jobScheduler and only handles
+// selection (which/how many jobs to return).
+func (s *jobScheduler) Pick(ctx context.Context, size int) ([]Job, error) {
+	jobs := make([]Job, 0, size)
+	for len(jobs) < size {
+		pickCtx, cancel := context.WithTimeout(ctx, s.timeout)
+		select {
+		case j := <-s.ready:
+			cancel()
+			if j != nil {
+				jobs = append(jobs, j)
+			}
+		case <-pickCtx.Done():
+			cancel()
+			if len(jobs) > 0 {
+				return jobs, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// pickCtx deadline exceeded, parent ctx still valid: retry
+			continue
+		}
+	}
+	return jobs, nil
 }
 
 func (s *jobScheduler) Start() error {
