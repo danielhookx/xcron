@@ -30,7 +30,7 @@ init:
 
 test: ## Run unittests
 	@go clean -testcache
-	@go test -short -race `go list ./...`
+	@go test -race ./...
 
 bench: ## Run benchmark of all
 	@go test ./... -v -bench=.
