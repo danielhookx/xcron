@@ -10,6 +10,7 @@ import (
 const defaultPickTimeout = 5 * time.Millisecond
 
 type job struct {
+	mu        sync.Mutex // protects td
 	scheduler *jobScheduler
 	next      Job
 	td        *TimerData
@@ -27,12 +28,20 @@ func (j *job) add() {
 	if next.Before(now) {
 		return
 	}
-	j.td = j.scheduler.timer.Add(next, j)
+	td := j.scheduler.timer.Add(next, j)
+	j.mu.Lock()
+	j.td = td
+	j.mu.Unlock()
 }
 
 func (j *job) remove() {
-	j.scheduler.timer.Del(j.td)
+	j.mu.Lock()
+	td := j.td
 	j.td = nil
+	j.mu.Unlock()
+	if td != nil {
+		j.scheduler.timer.Del(td)
+	}
 }
 
 var _ Scheduler = (*jobScheduler)(nil)
@@ -180,7 +189,12 @@ func (s *jobScheduler) del(j *job) {
 }
 
 func (s *jobScheduler) redo(j *job) {
-	s.timer.Set(j.td, j.schedule.Next(s.now()))
+	j.mu.Lock()
+	td := j.td
+	j.mu.Unlock()
+	if td != nil {
+		s.timer.Set(td, j.schedule.Next(s.now()))
+	}
 }
 
 func (s *jobScheduler) now() time.Time {
